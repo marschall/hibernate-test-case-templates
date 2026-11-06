@@ -1,12 +1,28 @@
 package org.hibernate.bugs;
 
-import org.hibernate.cfg.AvailableSettings;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
+import java.util.List;
+import java.util.function.Supplier;
+import java.util.stream.IntStream;
+
+import org.hibernate.StatelessSession;
+import org.hibernate.cfg.AvailableSettings;
+import org.hibernate.engine.jdbc.batch.internal.BatchBuilderImpl;
+import org.hibernate.engine.jdbc.batch.internal.BatchImpl;
+import org.hibernate.engine.jdbc.batch.spi.Batch;
+import org.hibernate.engine.jdbc.batch.spi.BatchKey;
+import org.hibernate.engine.jdbc.batch.spi.BatchObserver;
+import org.hibernate.engine.jdbc.mutation.group.PreparedStatementGroup;
+import org.hibernate.engine.jdbc.spi.JdbcCoordinator;
+import org.hibernate.engine.spi.SessionImplementor;
 import org.hibernate.testing.orm.junit.DomainModel;
 import org.hibernate.testing.orm.junit.ServiceRegistry;
 import org.hibernate.testing.orm.junit.SessionFactory;
 import org.hibernate.testing.orm.junit.SessionFactoryScope;
 import org.hibernate.testing.orm.junit.Setting;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -19,37 +35,107 @@ import org.junit.jupiter.api.Test;
  * submit it as a PR!
  */
 @DomainModel(
-		annotatedClasses = {
-				// Add your entities here.
-				// Foo.class,
-				// Bar.class
-		},
-		// If you use *.hbm.xml mappings, instead of annotations, add the mappings here.
-		xmlMappings = {
-				// "org/hibernate/test/Foo.hbm.xml",
-				// "org/hibernate/test/Bar.hbm.xml"
-		}
-)
+		annotatedClasses = SampleEntity.class
+		)
 @ServiceRegistry(
-		// Add in any settings that are specific to your test.  See resources/hibernate.properties for the defaults.
 		settings = {
-				// For your own convenience to see generated queries:
-				@Setting(name = AvailableSettings.SHOW_SQL, value = "true"),
-				@Setting(name = AvailableSettings.FORMAT_SQL, value = "true"),
-				// @Setting( name = AvailableSettings.GENERATE_STATISTICS, value = "true" ),
-
-				// Add your own settings that are a part of your quarkus configuration:
-				// @Setting( name = AvailableSettings.SOME_CONFIGURATION_PROPERTY, value = "SOME_VALUE" ),
+				@Setting(name = "hibernate.jdbc.batch_size", value = "2"),
+				@Setting(name = AvailableSettings.BUILDER, value = "org.hibernate.bugs.ORMUnitTestCase$CountingBatchBuilderImpl")
 		}
-)
+		)
 @SessionFactory
 class ORMUnitTestCase {
 
-	// Add your tests, using standard JUnit 5.
-	@Test
-	void hhh123Test(SessionFactoryScope scope) throws Exception {
-		scope.inTransaction( session -> {
-			// Do stuff...
-		} );
+	private static final ThreadLocal<Integer> IMPLICIT_FLUSHES = new ThreadLocal<>();
+
+	private static final ThreadLocal<Integer> EXPLICIT_FLUSHES = new ThreadLocal<>();
+
+	@BeforeEach
+	void resetFlushes() {
+		IMPLICIT_FLUSHES.set( 0 );
+		EXPLICIT_FLUSHES.set( 0 );
 	}
+
+	@Test
+	void insertMultiple(SessionFactoryScope scope) throws Exception {
+		scope.inStatelessTransaction( statelessSession -> {
+			List<SampleEntity> entities = generateEntities(10);
+			statelessSession.insertMultiple(entities);
+		} );
+		assertBatchingActive();
+		assertNoImplicitFlushes();
+	}
+
+	@Test
+	void insertMultiple_statelessWithOptions(SessionFactoryScope scope) throws Exception {
+		scope.inTransaction(session -> {
+			try (StatelessSession statelessSession = session.statelessWithOptions().connection().open()) {
+				List<SampleEntity> entities = generateEntities(10);
+				statelessSession.insertMultiple(entities);
+			}
+		});
+		assertBatchingActive();
+		assertNoImplicitFlushes();
+	}
+
+	@AfterEach
+	void cleanup(SessionFactoryScope scope) {
+		scope.dropData();
+		IMPLICIT_FLUSHES.remove();
+		EXPLICIT_FLUSHES.remove();
+	}
+
+	private static List<SampleEntity> generateEntities(int count) {
+		return IntStream.range(0, count)
+				.mapToObj(i -> new SampleEntity())
+				.toList();
+	}
+
+	private static void assertBatchingActive() {
+		// one for the sequence, one for the insert
+		assertEquals(2, EXPLICIT_FLUSHES.get(), "explicit flushes");
+	}
+
+	private void assertNoImplicitFlushes() {
+		assertEquals(0, IMPLICIT_FLUSHES.get(), "implicit flushed");
+	}
+
+	static class CountingBatchObserver implements BatchObserver {
+
+		@Override
+		public void batchExplicitlyExecuted() {
+			EXPLICIT_FLUSHES.set( EXPLICIT_FLUSHES.get() + 1 );
+		}
+
+		@Override
+		public void batchImplicitlyExecuted() {
+			IMPLICIT_FLUSHES.set(  IMPLICIT_FLUSHES.get() + 1 );
+		}
+
+	}
+
+	public static class CountingBatchBuilderImpl extends BatchBuilderImpl {
+
+		public CountingBatchBuilderImpl() {
+			super(2);
+		}
+
+		@Override
+		public BatchImpl buildBatch(BatchKey batchKey, Integer sizeOverride, String table, SessionImplementor session,
+				String sql) {
+			BatchImpl batch = super.buildBatch(batchKey, sizeOverride, table, session, sql);
+			batch.addObserver(new CountingBatchObserver());
+			return batch;
+		}
+
+		@Override
+		public Batch buildBatch(BatchKey key, Integer explicitBatchSize,
+				Supplier<PreparedStatementGroup> statementGroupSupplier, JdbcCoordinator jdbcCoordinator) {
+			Batch batch = super.buildBatch(key, explicitBatchSize, statementGroupSupplier, jdbcCoordinator);
+			batch.addObserver(new CountingBatchObserver());
+			return batch;
+		}
+
+	}
+
 }
